@@ -1,0 +1,4 @@
+org\aicte\approval\WorkflowEngineTest.class
+org\aicte\approval\AiServiceTest.class
+org\aicte\approval\AicteApprovalApplicationTests.class
+org\aicte\approval\SecurityAuthorizationTest.class

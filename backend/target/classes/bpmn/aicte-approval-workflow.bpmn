@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+                  xmlns:camunda="http://camunda.org/schema/1.0/bpmn"
+                  id="Definitions_AICTE_Approval"
+                  targetNamespace="http://bpmn.io/schema/bpmn"
+                  exporter="Camunda Modeler"
+                  exporterVersion="5.0.0">
+  <bpmn:process id="aicte-approval-workflow" name="AICTE Approval Lifecycle Workflow" isExecutable="true">
+    <bpmn:startEvent id="StartEvent_Submitted" name="Application Submitted by Institution">
+      <bpmn:outgoing>Flow_To_Scrutiny</bpmn:outgoing>
+    </bpmn:startEvent>
+
+    <bpmn:userTask id="Task_Scrutiny" name="Conduct Scrutiny &amp; Verification" camunda:candidateGroups="ROLE_SCRUTINY_COMMITTEE">
+      <bpmn:incoming>Flow_To_Scrutiny</bpmn:incoming>
+      <bpmn:incoming>Flow_Resubmission_To_Scrutiny</bpmn:incoming>
+      <bpmn:outgoing>Flow_Scrutiny_Gateway</bpmn:outgoing>
+    </bpmn:userTask>
+
+    <bpmn:exclusiveGateway id="Gateway_ScrutinyDecision" name="Scrutiny Assessment Outcome">
+      <bpmn:incoming>Flow_Scrutiny_Gateway</bpmn:incoming>
+      <bpmn:outgoing>Flow_Deficiency_Found</bpmn:outgoing>
+      <bpmn:outgoing>Flow_Evc_Required</bpmn:outgoing>
+      <bpmn:outgoing>Flow_Direct_Approval_Pending</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+
+    <bpmn:userTask id="Task_Deficiency_Response" name="Respond to Deficiencies &amp; Rectify" camunda:candidateGroups="ROLE_INSTITUTION">
+      <bpmn:incoming>Flow_Deficiency_Found</bpmn:incoming>
+      <bpmn:outgoing>Flow_Resubmission_To_Scrutiny</bpmn:outgoing>
+    </bpmn:userTask>
+
+    <bpmn:userTask id="Task_EVC_Inspection" name="Conduct Expert Visiting Committee (EVC)" camunda:candidateGroups="ROLE_EVC_COMMITTEE">
+      <bpmn:incoming>Flow_Evc_Required</bpmn:incoming>
+      <bpmn:outgoing>Flow_Evc_To_Gateway</bpmn:outgoing>
+    </bpmn:userTask>
+
+    <bpmn:exclusiveGateway id="Gateway_EvcOutcome" name="EVC Compliance Outcome">
+      <bpmn:incoming>Flow_Evc_To_Gateway</bpmn:incoming>
+      <bpmn:outgoing>Flow_Evc_To_SAC</bpmn:outgoing>
+      <bpmn:outgoing>Flow_Evc_To_Approval_Pending</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+
+    <bpmn:userTask id="Task_SAC_Appellate" name="Standing Appellate Committee (SAC) Review" camunda:candidateGroups="ROLE_SAC_COMMITTEE">
+      <bpmn:incoming>Flow_Evc_To_SAC</bpmn:incoming>
+      <bpmn:outgoing>Flow_SAC_To_Approval_Pending</bpmn:outgoing>
+    </bpmn:userTask>
+
+    <bpmn:userTask id="Task_CompetentAuthority" name="Statutory Determination by Competent Authority" camunda:candidateGroups="ROLE_COMPETENT_AUTHORITY">
+      <bpmn:incoming>Flow_Direct_Approval_Pending</bpmn:incoming>
+      <bpmn:incoming>Flow_Evc_To_Approval_Pending</bpmn:incoming>
+      <bpmn:incoming>Flow_SAC_To_Approval_Pending</bpmn:incoming>
+      <bpmn:outgoing>Flow_Final_Decision_Gateway</bpmn:outgoing>
+    </bpmn:userTask>
+
+    <bpmn:exclusiveGateway id="Gateway_FinalDecision" name="Final Determination">
+      <bpmn:incoming>Flow_Final_Decision_Gateway</bpmn:incoming>
+      <bpmn:outgoing>Flow_Decision_Approved</bpmn:outgoing>
+      <bpmn:outgoing>Flow_Decision_Rejected</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+
+    <bpmn:endEvent id="EndEvent_Approved" name="Approval Granted (EoA/LoA Issued)">
+      <bpmn:incoming>Flow_Decision_Approved</bpmn:incoming>
+    </bpmn:endEvent>
+
+    <bpmn:endEvent id="EndEvent_Rejected" name="Application Rejected (Reason Recorded)">
+      <bpmn:incoming>Flow_Decision_Rejected</bpmn:incoming>
+    </bpmn:endEvent>
+
+    <bpmn:sequenceFlow id="Flow_To_Scrutiny" sourceRef="StartEvent_Submitted" targetRef="Task_Scrutiny" />
+    <bpmn:sequenceFlow id="Flow_Scrutiny_Gateway" sourceRef="Task_Scrutiny" targetRef="Gateway_ScrutinyDecision" />
+    <bpmn:sequenceFlow id="Flow_Deficiency_Found" name="Deficiencies Found" sourceRef="Gateway_ScrutinyDecision" targetRef="Task_Deficiency_Response" />
+    <bpmn:sequenceFlow id="Flow_Resubmission_To_Scrutiny" sourceRef="Task_Deficiency_Response" targetRef="Task_Scrutiny" />
+    <bpmn:sequenceFlow id="Flow_Evc_Required" name="EVC Inspection Mandated" sourceRef="Gateway_ScrutinyDecision" targetRef="Task_EVC_Inspection" />
+    <bpmn:sequenceFlow id="Flow_Direct_Approval_Pending" name="Documents Compliant" sourceRef="Gateway_ScrutinyDecision" targetRef="Task_CompetentAuthority" />
+    <bpmn:sequenceFlow id="Flow_Evc_To_Gateway" sourceRef="Task_EVC_Inspection" targetRef="Gateway_EvcOutcome" />
+    <bpmn:sequenceFlow id="Flow_Evc_To_SAC" name="Disputed / Deficient" sourceRef="Gateway_EvcOutcome" targetRef="Task_SAC_Appellate" />
+    <bpmn:sequenceFlow id="Flow_Evc_To_Approval_Pending" name="EVC Recommended" sourceRef="Gateway_EvcOutcome" targetRef="Task_CompetentAuthority" />
+    <bpmn:sequenceFlow id="Flow_SAC_To_Approval_Pending" sourceRef="Task_SAC_Appellate" targetRef="Task_CompetentAuthority" />
+    <bpmn:sequenceFlow id="Flow_Final_Decision_Gateway" sourceRef="Task_CompetentAuthority" targetRef="Gateway_FinalDecision" />
+    <bpmn:sequenceFlow id="Flow_Decision_Approved" name="Approved" sourceRef="Gateway_FinalDecision" targetRef="EndEvent_Approved" />
+    <bpmn:sequenceFlow id="Flow_Decision_Rejected" name="Rejected" sourceRef="Gateway_FinalDecision" targetRef="EndEvent_Rejected" />
+  </bpmn:process>
+</bpmn:definitions>
