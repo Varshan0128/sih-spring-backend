@@ -7,12 +7,12 @@ spring:
   application:
     name: aicte-approval-backend
   profiles:
-    active: dev
+    default: dev
 
   datasource:
-    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/aicte_approval_db}
-    username: ${SPRING_DATASOURCE_USERNAME:postgres}
-    password: ${SPRING_DATASOURCE_PASSWORD:sivabalaji007}
+    url: ${SPRING_DATASOURCE_URL}
+    username: ${SPRING_DATASOURCE_USERNAME}
+    password: ${SPRING_DATASOURCE_PASSWORD}
     driver-class-name: org.postgresql.Driver
     hikari:
       maximum-pool-size: 15
@@ -39,11 +39,10 @@ spring:
       max-file-size: 25MB
       max-request-size: 30MB
 
-# Application specific properties
 app:
   jwt:
-    secret: ${JWT_SECRET:404E635266556A586E3272357538782F413F4428472B4B6250645367566B5970337336763979244226452948404D6351}
-    expiration-ms: ${JWT_EXPIRATION_MS:86400000} # 24 hours
+    secret: ${JWT_SECRET}
+    expiration-ms: ${JWT_EXPIRATION_MS:86400000}
   cors:
     allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:3000,http://localhost:5173,http://localhost:4200}
   minio:
@@ -55,8 +54,8 @@ app:
     base-url: ${AI_SERVICE_URL:http://localhost:8000}
     timeout-ms: ${AI_SERVICE_TIMEOUT_MS:10000}
   sla:
-    escalation-check-interval-cron: "0 */15 * * * *" # Every 15 minutes
-    reminder-check-interval-cron: "0 0 9 * * *" # Daily 9 AM
+    escalation-check-interval-cron: "0 */15 * * * *"
+    reminder-check-interval-cron: "0 0 9 * * *"
 
 management:
   endpoints:
@@ -65,7 +64,7 @@ management:
         include: health,info,prometheus,metrics
   endpoint:
     health:
-      show-details: always
+      show-details: never
 
 springdoc:
   api-docs:
