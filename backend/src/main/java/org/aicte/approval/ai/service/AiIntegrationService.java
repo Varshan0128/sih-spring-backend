@@ -1,5 +1,6 @@
 package org.aicte.approval.ai.service;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.aicte.approval.ai.dto.AiDtos;
@@ -17,7 +18,8 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.web.client.RestTemplate;
+import java.util.HashMap;
+import java.util.Map;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
@@ -38,10 +40,7 @@ public class AiIntegrationService {
     private final ComplianceRequirementRepository complianceRepository;
     private final DocumentMetadataRepository documentMetadataRepository;
 
-    @Value("${app.ai-service.base-url:http://localhost:8000}")
-    private String aiServiceBaseUrl;
-
-    private final RestTemplate restTemplate = new RestTemplate();
+    private final PythonAiClient pythonAiClient;
 
     @Transactional(readOnly = true)
     public AiDtos.RiskScoreResponse calculateRiskScore(Long applicationId) {
@@ -50,12 +49,53 @@ public class AiIntegrationService {
 
         SecurityUtils.validateInstitutionAccess(app.getInstitution().getId());
 
-        // Attempt calling FastAPI service if available
         try {
-            String url = aiServiceBaseUrl + "/internal/ai/risk-score";
-            // If service responds, return model prediction
+            Instant now = Instant.now();
+            Instant submittedAt = app.getSubmissionDate() != null ? app.getSubmissionDate() : app.getCreatedAt();
+            int ageDays = (int) Math.max(0, Duration.between(submittedAt, now).toDays());
+            int remainingSlaDays = app.getSlaDeadline() == null
+                    ? 10 : (int) Duration.between(now, app.getSlaDeadline()).toDays();
+
+            Optional<EvcRecord> evcOpt = evcRecordRepository.findByApplicationId(applicationId);
+            String evcStatus = "PENDING";
+            if (evcOpt.isPresent()) {
+                EvcRecord evc = evcOpt.get();
+                if ("OVERDUE".equalsIgnoreCase(evc.getStatus())) evcStatus = "OVERDUE";
+                else if ("DEFICIENT".equalsIgnoreCase(evc.getComplianceStatus())) evcStatus = "DEFICIENT";
+                else if ("COMPLETED".equalsIgnoreCase(evc.getStatus())) evcStatus = "COMPLETED";
+            }
+
+            long expiringSoon = documentMetadataRepository
+                    .findDocumentsExpiringBefore(LocalDate.now().plusDays(30)).stream()
+                    .filter(d -> d.getApplication().getId().equals(applicationId)).count();
+            long pendingCompliance = complianceRepository.countByApplicationIdAndStatus(applicationId, "PENDING");
+
+            Map<String, Object> payload = new HashMap<>();
+            payload.put("application_id", app.getId());
+            payload.put("current_stage", app.getCurrentStage().name());
+            payload.put("stage_age_days", ageDays);
+            payload.put("sla_breached", app.isSlaBreached());
+            payload.put("sla_remaining_days", remainingSlaDays);
+            payload.put("evc_status", evcStatus);
+            payload.put("compliance_pending_count", (int) pendingCompliance);
+            payload.put("documents_expiring_within_30_days", (int) expiringSoon);
+            payload.put("unverified_docs_count", 0);
+
+            JsonNode result = pythonAiClient.post("/internal/ai/risk-score", payload);
+            return AiDtos.RiskScoreResponse.builder()
+                    .applicationId(app.getId())
+                    .applicationNumber(app.getApplicationNumber())
+                    .riskScore(result.path("risk_score").asInt())
+                    .riskLevel(result.path("risk_level").asText("LOW"))
+                    .delayProbability(BigDecimal.valueOf(result.path("delay_probability").asDouble()))
+                    .contributingFactors(readStringList(result.path("contributing_factors")))
+                    .modelVersion(result.path("model_version").asText("v1.0.0-rules-baseline"))
+                    .isBaseline(result.path("is_baseline").asBoolean(true))
+                    .baselineExplanation(result.path("explanation").asText("Python AI rules baseline"))
+                    .timestamp(Instant.now())
+                    .build();
         } catch (Exception ex) {
-            log.debug("Python AI Service unavailable, using transparent rules baseline: {}", ex.getMessage());
+            log.warn("Python risk-score call failed; using Java rules baseline: {}", ex.getMessage());
         }
 
         // Transparent Rule-Based Baseline Engine
@@ -134,8 +174,35 @@ public class AiIntegrationService {
         SecurityUtils.validateInstitutionAccess(app.getInstitution().getId());
 
         Instant now = Instant.now();
-        int ageDays = (int) Duration.between(app.getSubmissionDate() != null ?
-                app.getSubmissionDate() : app.getCreatedAt(), now).toDays();
+        int ageDays = (int) Math.max(0, Duration.between(app.getSubmissionDate() != null ?
+                app.getSubmissionDate() : app.getCreatedAt(), now).toDays());
+
+        try {
+            Map<String, Object> payload = new HashMap<>();
+            payload.put("application_id", app.getId());
+            payload.put("application_number", app.getApplicationNumber());
+            payload.put("current_stage", app.getCurrentStage().name());
+            payload.put("stage_age_days", ageDays);
+            payload.put("sla_limit_days", 14);
+            payload.put("evc_status", "PENDING");
+            payload.put("pending_deficiencies", (int) complianceRepository
+                    .countByApplicationIdAndStatus(applicationId, "PENDING"));
+
+            JsonNode result = pythonAiClient.post("/internal/ai/bottleneck", payload);
+            return AiDtos.BottleneckResponse.builder()
+                    .applicationId(app.getId())
+                    .applicationNumber(app.getApplicationNumber())
+                    .currentStage(app.getCurrentStage().name())
+                    .bottleneckStage(result.path("bottleneck_stage").asText(app.getCurrentStage().name()))
+                    .primaryBottleneck(result.path("primary_bottleneck").asText())
+                    .daysInCurrentStage(result.path("days_stuck").asInt(ageDays))
+                    .slaLimitDays(14)
+                    .evidenceFactors(readStringList(result.path("evidence_factors")))
+                    .recommendedOfficialAction(result.path("recommended_official_action").asText())
+                    .build();
+        } catch (Exception ex) {
+            log.warn("Python bottleneck call failed; using Java rules baseline: {}", ex.getMessage());
+        }
 
         String primaryBottleneck;
         String recommendedAction;
@@ -180,6 +247,34 @@ public class AiIntegrationService {
 
         SecurityUtils.validateInstitutionAccess(app.getInstitution().getId());
 
+        try {
+            Map<String, Object> payload = new HashMap<>();
+            payload.put("application_id", app.getId());
+            payload.put("application_number", app.getApplicationNumber());
+            payload.put("institution_name", app.getInstitution().getName());
+            payload.put("current_stage", app.getCurrentStage().name());
+            payload.put("risk_score", app.getRiskScore() == null ? 0 : app.getRiskScore());
+            payload.put("primary_bottleneck", app.getPrimaryBottleneck());
+            payload.put("sla_deadline", app.getSlaDeadline() == null ? null : app.getSlaDeadline().toString());
+
+            JsonNode result = pythonAiClient.post("/internal/ai/case-summary", payload);
+            return AiDtos.CaseSummaryResponse.builder()
+                    .applicationId(app.getId())
+                    .applicationNumber(app.getApplicationNumber())
+                    .institutionName(app.getInstitution().getName())
+                    .currentStage(result.path("current_stage").asText(app.getCurrentStage().name()))
+                    .summaryText(result.path("summary_text").asText())
+                    .pendingAction(result.path("pending_action").asText())
+                    .primaryRisk((app.getRiskLevel() == null ? "LOW" : app.getRiskLevel())
+                            + " Risk (" + (app.getRiskScore() == null ? 0 : app.getRiskScore()) + "/100)")
+                    .keyMilestones(readStringList(result.path("key_risks")))
+                    .slaDeadline(app.getSlaDeadline())
+                    .generatedAt(Instant.now())
+                    .build();
+        } catch (Exception ex) {
+            log.warn("Python case-summary call failed; using Java rules baseline: {}", ex.getMessage());
+        }
+
         List<String> milestones = List.of(
                 "Application created and verified by Institution",
                 "Submitted with statutory undertakings",
@@ -217,6 +312,48 @@ public class AiIntegrationService {
     public List<AiDtos.PriorityQueueItemDto> getSmartPriorityQueue() {
         List<Application> topApps = applicationRepository.findTopPriorityApplications(PageRequest.of(0, 10));
 
+        try {
+            List<Map<String, Object>> cases = new ArrayList<>();
+            for (Application app : topApps) {
+                Map<String, Object> item = new HashMap<>();
+                item.put("application_id", app.getId());
+                item.put("application_number", app.getApplicationNumber());
+                item.put("institution_name", app.getInstitution().getName());
+                item.put("stage", app.getCurrentStage().name());
+                item.put("sla_remaining_days", app.getSlaDeadline() == null ? 10 :
+                        (int) Duration.between(Instant.now(), app.getSlaDeadline()).toDays());
+                item.put("sla_breached", app.isSlaBreached());
+                item.put("risk_score", app.getRiskScore() == null ? 0 : app.getRiskScore());
+                item.put("evc_status", "PENDING");
+                cases.add(item);
+            }
+
+            JsonNode ranked = pythonAiClient.post("/internal/ai/prioritize", Map.of("cases", cases));
+            if (ranked.isArray()) {
+                List<AiDtos.PriorityQueueItemDto> remoteQueue = new ArrayList<>();
+                for (JsonNode item : ranked) {
+                    Long id = item.path("application_id").asLong();
+                    Application app = topApps.stream().filter(a -> a.getId().equals(id)).findFirst().orElse(null);
+                    if (app == null) continue;
+                    remoteQueue.add(AiDtos.PriorityQueueItemDto.builder()
+                            .applicationId(id)
+                            .applicationNumber(app.getApplicationNumber())
+                            .institutionName(app.getInstitution().getName())
+                            .region(app.getInstitution().getRegion())
+                            .stage(app.getCurrentStage().name())
+                            .riskScore(app.getRiskScore())
+                            .riskLevel(app.getRiskLevel())
+                            .priorityRank(item.path("priority_rank").asInt())
+                            .urgencyReason(item.path("urgency_reason").asText())
+                            .slaDeadline(app.getSlaDeadline())
+                            .build());
+                }
+                return remoteQueue;
+            }
+        } catch (Exception ex) {
+            log.warn("Python priority-queue call failed; using Java rules baseline: {}", ex.getMessage());
+        }
+
         List<AiDtos.PriorityQueueItemDto> queue = new ArrayList<>();
         int rank = 1;
         for (Application app : topApps) {
@@ -242,6 +379,24 @@ public class AiIntegrationService {
     public AiDtos.AssistantQueryResponse answerAssistantQuery(AiDtos.AssistantQueryRequest request) {
         UserPrincipal user = SecurityUtils.getRequiredCurrentUser();
         String query = request.getQuery();
+
+        try {
+            Map<String, Object> payload = new HashMap<>();
+            payload.put("query", query);
+            if (request.getContextApplicationId() != null) {
+                payload.put("context_application_id", request.getContextApplicationId());
+            }
+            JsonNode result = pythonAiClient.post("/internal/ai/assistant", payload);
+            return AiDtos.AssistantQueryResponse.builder()
+                    .query(result.path("query").asText(query))
+                    .answer(result.path("answer").asText())
+                    .citations(readStringList(result.path("citations")))
+                    .authorizedSources(readStringList(result.path("authorized_sources_used")))
+                    .accessPermitted(result.path("access_permitted").asBoolean(false))
+                    .build();
+        } catch (Exception ex) {
+            log.warn("Python assistant call failed; using Java rules baseline: {}", ex.getMessage());
+        }
 
         String answer;
         List<String> citations = new ArrayList<>();
@@ -282,6 +437,45 @@ public class AiIntegrationService {
 
     @Transactional(readOnly = true)
     public AiDtos.DelayPredictionResponse predictDelay(Long applicationId) {
+        Application app = applicationRepository.findById(applicationId)
+                .orElseThrow(() -> new ResourceNotFoundException("Application", "id", applicationId));
+        SecurityUtils.validateInstitutionAccess(app.getInstitution().getId());
+
+        Instant now = Instant.now();
+        int ageDays = (int) Math.max(0, Duration.between(app.getSubmissionDate() != null ?
+                app.getSubmissionDate() : app.getCreatedAt(), now).toDays());
+        int remainingSlaDays = app.getSlaDeadline() == null ? 10 :
+                (int) Duration.between(now, app.getSlaDeadline()).toDays();
+
+        try {
+            Map<String, Object> payload = new HashMap<>();
+            payload.put("application_id", app.getId());
+            payload.put("current_stage", app.getCurrentStage().name());
+            payload.put("stage_age_days", ageDays);
+            payload.put("remaining_sla_days", remainingSlaDays);
+            payload.put("previous_stage_durations_days", List.of());
+            payload.put("is_evc_required", true);
+            payload.put("evc_status", "PENDING");
+            payload.put("pending_deficiencies_count", (int) complianceRepository
+                    .countByApplicationIdAndStatus(applicationId, "PENDING"));
+            payload.put("workload_in_region", 15);
+
+            JsonNode result = pythonAiClient.post("/internal/ai/delay-prediction", payload);
+            return AiDtos.DelayPredictionResponse.builder()
+                    .applicationId(app.getId())
+                    .applicationNumber(app.getApplicationNumber())
+                    .currentStage(app.getCurrentStage().name())
+                    .riskLevel(result.path("risk_level").asText("LOW"))
+                    .delayProbability(BigDecimal.valueOf(result.path("delay_probability").asDouble()))
+                    .estimatedDelayDays(result.path("estimated_days_to_completion").asInt())
+                    .modelVersion(result.path("model_version").asText("v1.0.0-rules-baseline"))
+                    .contributingFactors(readStringList(result.path("contributing_factors")))
+                    .predictionTimestamp(Instant.now())
+                    .build();
+        } catch (Exception ex) {
+            log.warn("Python delay-prediction call failed; using Java rules baseline: {}", ex.getMessage());
+        }
+
         AiDtos.RiskScoreResponse risk = calculateRiskScore(applicationId);
         int estDays = risk.getRiskScore() >= 70 ? 12 : (risk.getRiskScore() >= 40 ? 5 : 0);
 
@@ -302,6 +496,34 @@ public class AiIntegrationService {
     public AiDtos.AnomalyResponse detectAnomalies(Long applicationId) {
         Application app = applicationRepository.findById(applicationId)
                 .orElseThrow(() -> new ResourceNotFoundException("Application", "id", applicationId));
+        SecurityUtils.validateInstitutionAccess(app.getInstitution().getId());
+
+        try {
+            Instant submittedAt = app.getSubmissionDate() != null ? app.getSubmissionDate() : app.getCreatedAt();
+            int ageDays = (int) Math.max(0, Duration.between(submittedAt, Instant.now()).toDays());
+            Map<String, Object> stageDurations = new HashMap<>();
+            stageDurations.put(app.getCurrentStage().name(), ageDays);
+            Map<String, Object> payload = new HashMap<>();
+            payload.put("stage_durations", stageDurations);
+            payload.put("return_count", 0);
+            payload.put("document_rejection_count", 0);
+
+            JsonNode result = pythonAiClient.post("/internal/ai/anomaly-detection", payload);
+            List<String> anomalyTypes = readStringList(result.path("anomaly_types"));
+            boolean detected = result.path("is_anomaly_detected").asBoolean(false);
+            double confidence = result.path("confidence_score").asDouble(0.0);
+            String severity = confidence >= 0.80 ? "HIGH" : (confidence >= 0.60 ? "MEDIUM" : "LOW");
+            return AiDtos.AnomalyResponse.builder()
+                    .applicationId(app.getId())
+                    .applicationNumber(app.getApplicationNumber())
+                    .anomalyType(detected && !anomalyTypes.isEmpty() ? anomalyTypes.get(0) : "NO_ANOMALY")
+                    .description(result.path("explanation").asText("No irregularity detected"))
+                    .severity(severity)
+                    .evidence(String.join("; ", anomalyTypes))
+                    .build();
+        } catch (Exception ex) {
+            log.warn("Python anomaly-detection call failed; using Java rules baseline: {}", ex.getMessage());
+        }
 
         String anomaly = "NO_ANOMALY";
         String desc = "No behavioral or document irregularities detected.";
@@ -321,5 +543,15 @@ public class AiIntegrationService {
                 .severity(severity)
                 .evidence("Historical workflow telemetry and regional cohort statistics")
                 .build();
+    }
+
+    private List<String> readStringList(JsonNode node) {
+        List<String> values = new ArrayList<>();
+        if (node != null && node.isArray()) {
+            node.forEach(value -> {
+                if (!value.isNull()) values.add(value.asText());
+            });
+        }
+        return values;
     }
 }
